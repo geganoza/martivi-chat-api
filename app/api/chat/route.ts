@@ -1,49 +1,90 @@
 export const runtime = "nodejs";
+
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { z } from "zod";
 
-// CORS
-const ORIGIN = process.env.ALLOWED_ORIGIN || "https://www.martiviconsulting.com";
-const CORS = {
-  "Access-Control-Allow-Origin": ORIGIN,
-  "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
-  "Access-Control-Allow-Headers": "Content-Type"
+// -------- Env --------
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "";
+const CALENDLY =
+  process.env.NEXT_PUBLIC_CALENDLY_LINK ??
+  "https://calendly.com/martividigital/30min";
+const WEBHOOK = process.env.LEAD_WEBHOOK_URL ?? "";
+
+/**
+ * Comma-separated allowlist, e.g.:
+ * "https://martiviconsulting.com, https://www.martiviconsulting.com"
+ * If empty, we allow "*".
+ */
+const ALLOW_ORIGINS = (process.env.CORS_ORIGIN ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// -------- OpenAI --------
+const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// -------- Types / Schema --------
+type Role = "system" | "user" | "assistant";
+type ChatMessage = { role: Role; content: string };
+type Lead = {
+  name?: string;
+  email?: string;
+  company?: string;
+  budget?: string;
+  timeline?: string;
+  country?: string;
 };
 
-export async function OPTIONS() {
-  return new NextResponse(null, { status: 204, headers: CORS });
-}
-export async function GET() {
-  return NextResponse.json({ ok: true }, { headers: CORS });
-}
-
-// lazy client (so OPTIONS/GET don't require the key)
-function getOpenAI() {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("OPENAI_API_KEY missing");
-  return new OpenAI({ apiKey });
-}
-
-type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
-type Lead = { name?: string; email?: string; company?: string; budget?: string; timeline?: string; country?: string };
-
 const BodySchema = z.object({
-  messages: z.array(z.object({
-    role: z.enum(["system","user","assistant"]),
-    content: z.string()
-  })).default([]),
-  lead: z.object({
-    name: z.string().optional(),
-    email: z.string().optional(),
-    company: z.string().optional(),
-    budget: z.string().optional(),
-    timeline: z.string().optional(),
-    country: z.string().optional(),
-  }).optional()
+  messages: z
+    .array(
+      z.object({
+        role: z.enum(["system", "user", "assistant"]),
+        content: z.string(),
+      })
+    )
+    .default([]),
+  lead: z
+    .object({
+      name: z.string().optional(),
+      email: z.string().optional(),
+      company: z.string().optional(),
+      budget: z.string().optional(),
+      timeline: z.string().optional(),
+      country: z.string().optional(),
+    })
+    .optional(),
 });
 
-const CALENDLY = process.env.NEXT_PUBLIC_CALENDLY_LINK || "#";
+// -------- CORS helper (echo exact origin when allowed) --------
+function corsHeaders(req: NextRequest) {
+  const origin = req.headers.get("origin") || "";
+  const allow =
+    ALLOW_ORIGINS.length === 0
+      ? "*"
+      : ALLOW_ORIGINS.includes(origin)
+      ? origin
+      : ALLOW_ORIGINS[0]; // fallback to first allowed
+
+  return {
+    "Access-Control-Allow-Origin": allow,
+    "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
+    "Access-Control-Allow-Headers": "Content-Type",
+    Vary: "Origin",
+  };
+}
+
+function json(req: NextRequest, body: unknown, init?: number | ResponseInit) {
+  const base: ResponseInit =
+    typeof init === "number" ? { status: init } : init ?? {};
+  return NextResponse.json(body, {
+    ...base,
+    headers: { ...(base.headers || {}), ...corsHeaders(req) },
+  });
+}
+
+// -------- Routes --------
 const SYSTEM_PROMPT = `You are MARTIVI CONSULTING’s assistant.
 Goals:
 1) Understand the user’s need in 2–3 short questions max.
@@ -54,48 +95,64 @@ Goals:
    - Full name, Email, Company (optional), Budget range, Timeline, Country.
 Tone: warm, expert, practical. Keep answers under 8 sentences unless asked.`;
 
+// Healthcheck
+export async function GET(req: NextRequest) {
+  return json(req, { ok: true });
+}
+
+// Preflight
+export async function OPTIONS(req: NextRequest) {
+  return new NextResponse(null, { status: 204, headers: corsHeaders(req) });
+}
+
+// Chat
 export async function POST(req: NextRequest) {
   try {
-    const json = await req.json();
-    const { messages, lead } = BodySchema.parse(json);
+    if (!OPENAI_API_KEY) return json(req, { error: "OPENAI_API_KEY missing" }, 500);
 
-    const client = getOpenAI(); // <-- create here
-    const trimmed: ChatMessage[] = (messages ?? []).slice(-12);
+    const parsed = BodySchema.parse(await req.json());
+    const trimmed: ChatMessage[] = (parsed.messages ?? []).slice(-12);
 
     const completion = await client.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.4,
-      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...trimmed]
+      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...trimmed],
     });
 
-    const text = (completion.choices[0]?.message?.content ?? "").replace("[#]", CALENDLY);
+    const raw = completion.choices[0]?.message?.content ?? "";
 
-    const maybeLead =
-      /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(text) || (lead && lead.email);
+    // Strip Calendly links; UI shows the button instead.
+    const cleaned = raw
+      .replace(/\[.*?\]\(https?:\/\/calendly\.com[^\)]*\)/gi, "")
+      .replace(/https?:\/\/calendly\.com[^\s)]+/gi, "")
+      .trim();
 
-    const webhook = process.env.LEAD_WEBHOOK_URL;
-    if (maybeLead && webhook) {
+    // Simple lead signal: email in reply or provided
+    const hasEmailInReply = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(raw);
+    const maybeLead = hasEmailInReply || Boolean(parsed.lead?.email);
+
+    if (maybeLead && WEBHOOK) {
       const payload = {
         source: "chatbot",
-        lead: lead || {},
-        rawReply: text,
-        when: new Date().toISOString()
+        lead: parsed.lead ?? ({} as Lead),
+        rawReply: raw,
+        when: new Date().toISOString(),
       };
       try {
-        await fetch(webhook, {
+        await fetch(WEBHOOK, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
+          body: JSON.stringify(payload),
         });
-      } catch (err) {
-        console.error("Lead webhook error:", err);
+      } catch (e) {
+        console.error("Lead webhook error:", e);
       }
     }
 
-    return NextResponse.json({ reply: text }, { headers: CORS });
-  } catch (e: unknown) {
+    return json(req, { reply: cleaned });
+  } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    const status = String(msg).includes("OPENAI_API_KEY") ? 500 : 400;
-    return NextResponse.json({ error: msg }, { status, headers: CORS });
+    console.error("Chat error:", msg);
+    return json(req, { error: "bad_request" }, 400);
   }
 }

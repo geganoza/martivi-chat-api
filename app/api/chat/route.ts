@@ -18,7 +18,7 @@ const WEBHOOK = process.env.LEAD_WEBHOOK_URL ?? "";
  */
 const ALLOW_ORIGINS = (process.env.CORS_ORIGIN ?? "")
   .split(",")
-  .map((s) => s.trim())
+  .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
 // -------- OpenAI --------
@@ -57,15 +57,16 @@ const BodySchema = z.object({
     .optional(),
 });
 
-// -------- CORS helper (echo exact origin when allowed) --------
+// -------- CORS helper (normalize origin and echo if allowed) --------
 function corsHeaders(req: NextRequest) {
-  const origin = req.headers.get("origin") || "";
+  const origin = (req.headers.get("origin") || "").trim().toLowerCase();
+
   const allow =
     ALLOW_ORIGINS.length === 0
-      ? "*"
+      ? "*" // allow all if none configured
       : ALLOW_ORIGINS.includes(origin)
-      ? origin
-      : ALLOW_ORIGINS[0]; // fallback to first allowed
+      ? origin // echo exact origin if matched
+      : ALLOW_ORIGINS[0]; // fallback to first
 
   return {
     "Access-Control-Allow-Origin": allow,
@@ -108,7 +109,8 @@ export async function OPTIONS(req: NextRequest) {
 // Chat
 export async function POST(req: NextRequest) {
   try {
-    if (!OPENAI_API_KEY) return json(req, { error: "OPENAI_API_KEY missing" }, 500);
+    if (!OPENAI_API_KEY)
+      return json(req, { error: "OPENAI_API_KEY missing" }, 500);
 
     const parsed = BodySchema.parse(await req.json());
     const trimmed: ChatMessage[] = (parsed.messages ?? []).slice(-12);
@@ -128,7 +130,8 @@ export async function POST(req: NextRequest) {
       .trim();
 
     // Simple lead signal: email in reply or provided
-    const hasEmailInReply = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(raw);
+    const hasEmailInReply =
+      /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(raw);
     const maybeLead = hasEmailInReply || Boolean(parsed.lead?.email);
 
     if (maybeLead && WEBHOOK) {
